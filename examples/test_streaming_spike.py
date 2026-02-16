@@ -1,8 +1,8 @@
 """
 Hybrid Streaming: Direct Coordinator Pull + On-Demand Ray Datasets.
 
-Part A: Real-time streaming via StreamingIterator.__iter__()
-  - Spark rate source -> foreachBatch(sink) -> coordinator -> StreamingIterator
+Part A: Real-time streaming via from_spark_streaming()
+  - Spark rate source -> from_spark_streaming() -> StreamingIterator
   - Validates that data arrives while the streaming query is still active
 
 Part B: Windowed Ray Datasets via StreamingIterator.iter_datasets()
@@ -21,9 +21,9 @@ import pyarrow as pa
 import ray
 import raydp
 from raydp.streaming import (
-    MicroBatchCoordinator,
+    StreamCoordinator,
     StreamingIterator,
-    create_streaming_sink,
+    from_spark_streaming,
 )
 
 os.environ["RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO"] = "0"
@@ -48,13 +48,12 @@ JDK17_JAVA_OPTS = " ".join([
 
 MIN_CONSUMER_TABLES = 5
 TIMEOUT_SECONDS = 30
-MAX_BUFFERED = 2
 
 # ============================================================
 # Part A: Real-Time Streaming
 # ============================================================
 print("=" * 60)
-print("PART A: Real-Time Streaming (StreamingIterator.__iter__)")
+print("PART A: Real-Time Streaming (from_spark_streaming)")
 print("=" * 60)
 
 # ---------- 1. Init Ray + Spark ----------
@@ -85,11 +84,24 @@ print(f"Spark {spark.version} ready")
 print("Waiting 10s for executors to register...")
 time.sleep(10)
 
-# ---------- 2. Create coordinator ----------
-print("\n=== Creating MicroBatchCoordinator ===")
-coordinator = MicroBatchCoordinator.remote(max_buffered_batches=MAX_BUFFERED)
+# ---------- 2. Start streaming via public API ----------
+print("\n=== Starting streaming via from_spark_streaming() ===")
+rate_stream = (
+    spark.readStream
+    .format("rate")
+    .option("rowsPerSecond", "10")
+    .load()
+)
 
-# ---------- 3. Start consumer thread ----------
+iterator, query = from_spark_streaming(
+    rate_stream,
+    stream_id="spike_a",
+    max_buffered_batches=2,
+    trigger={"processingTime": "2 seconds"},
+)
+print(f"Streaming query started: {query.name}")
+
+# ---------- 3. Consume in a thread ----------
 consumed_tables = []
 consumed_timestamps = []
 consumer_error = None
@@ -98,8 +110,7 @@ consumer_error = None
 def consumer_thread_fn():
     global consumer_error
     try:
-        it = StreamingIterator(coordinator)
-        for table in it:
+        for table in iterator:
             consumed_tables.append(table)
             consumed_timestamps.append(time.time())
             print(f"  [consumer] got table {len(consumed_tables)}: "
@@ -112,26 +123,7 @@ print("\n=== Starting consumer thread ===")
 consumer = threading.Thread(target=consumer_thread_fn, daemon=True)
 consumer.start()
 
-# ---------- 4. Start Spark streaming ----------
-print("=== Starting Spark Structured Streaming (rate source) ===")
-rate_stream = (
-    spark.readStream
-    .format("rate")
-    .option("rowsPerSecond", "10")
-    .load()
-)
-
-sink_fn = create_streaming_sink(coordinator)
-
-query = (
-    rate_stream.writeStream
-    .foreachBatch(sink_fn)
-    .trigger(processingTime="2 seconds")
-    .start()
-)
-print(f"Streaming query started: {query.name}")
-
-# ---------- 5. Wait for consumer to collect 5+ tables while streaming ----------
+# ---------- 4. Wait for consumer to collect 5+ tables while streaming ----------
 print(f"\n=== Waiting for consumer to receive {MIN_CONSUMER_TABLES}+ "
       f"tables (timeout {TIMEOUT_SECONDS}s) ===")
 deadline = time.time() + TIMEOUT_SECONDS
@@ -141,17 +133,15 @@ while len(consumed_tables) < MIN_CONSUMER_TABLES and time.time() < deadline:
 tables_while_active = len(consumed_tables)
 print(f"Consumer received {tables_while_active} tables while streaming was active")
 
-# ---------- 6. Mid-stream stats ----------
+# ---------- 5. Mid-stream stats ----------
+coordinator = ray.get_actor("stream_coord_spike_a")
 stats_midstream = ray.get(coordinator.get_stats.remote())
 print(f"Mid-stream coordinator stats: {stats_midstream}")
 
-# ---------- 7. Clean shutdown ----------
+# ---------- 6. Clean shutdown ----------
 print("\n=== Shutting down ===")
 query.stop()
 print("Spark streaming stopped")
-
-ray.get(coordinator.mark_complete.remote())
-print("Coordinator marked complete")
 
 consumer.join(timeout=30)
 consumer_joined = not consumer.is_alive()
@@ -172,7 +162,9 @@ print("PART B: Windowed Datasets (StreamingIterator.iter_datasets)")
 print("=" * 60)
 
 # ---------- 1. Fresh coordinator (no Spark needed) ----------
-coord_b = MicroBatchCoordinator.remote(max_buffered_batches=10)
+coord_b = StreamCoordinator.options(
+    name="stream_coord_spike_b",
+).remote(stream_id="spike_b", max_buffered_batches=10)
 
 # ---------- 2. Push 6 Arrow tables manually ----------
 for i in range(6):
@@ -180,8 +172,11 @@ for i in range(6):
         "id": pa.array(range(i * 10, i * 10 + 10), type=pa.int64()),
         "value": pa.array([float(i)] * 10, type=pa.float64()),
     })
-    ray.get(coord_b.put_batch.remote(table))
-ray.get(coord_b.mark_complete.remote())
+    ref = ray.put(table)
+    schema_bytes = table.schema.serialize().to_pybytes()
+    ray.get(coord_b.publish_batch.remote([ref], schema_bytes, table.num_rows))
+
+ray.get(coord_b.signal_complete.remote())
 print("Pushed 6 tables (10 rows each) and marked complete")
 
 # ---------- 3. Iterate windowed datasets ----------
@@ -223,13 +218,13 @@ all_have_schema = all(
 check(2, "Data integrity (all tables have expected schema columns)",
       all_have_schema)
 
-# 3: Coordinator bridges foreachBatch -> consumer
-check(3, f"Coordinator bridged batches (got={stats_final['batches_got']})",
-      stats_final["batches_got"] >= MIN_CONSUMER_TABLES)
+# 3: Coordinator bridged batches
+check(3, f"Coordinator bridged batches (published={stats_final['batches_published']})",
+      stats_final["batches_published"] >= MIN_CONSUMER_TABLES)
 
-# 4: Backpressure — peak buffer never exceeded max_buffered_batches
-check(4, f"Backpressure (peak_buffer={stats_final['peak_buffer']} <= max={MAX_BUFFERED})",
-      stats_final["peak_buffer"] <= MAX_BUFFERED)
+# 4: Backpressure — buffer never exceeded max_buffered_batches
+check(4, f"Backpressure (buffer_size={stats_final['buffer_size']} <= max=2)",
+      stats_final["buffer_size"] <= 2)
 
 # 5: Clean shutdown — consumer thread joined without hanging
 check(5, "Clean shutdown (consumer thread joined)", consumer_joined)

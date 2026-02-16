@@ -1,32 +1,62 @@
+import uuid
+
 import ray
 import ray.data
 
 
 class StreamingIterator:
-    """Pulls Arrow tables from a MicroBatchCoordinator in real-time.
+    """Pulls Arrow tables from a StreamCoordinator in real-time.
 
     Two consumption modes:
-      - __iter__(): yields pa.Table as each micro-batch arrives (simple path)
-      - iter_datasets(window_size): accumulates N tables, yields a
-        ray.data.Dataset per window (Ray Data path)
+      - __iter__(): yields pa.Table as each micro-batch arrives
+      - iter_datasets(window_size): accumulates N tables into a
+        ray.data.Dataset per window
     """
 
-    def __init__(self, coordinator):
+    def __init__(self, coordinator, consumer_id: str = None):
         self._coordinator = coordinator
+        self._consumer_id = consumer_id or f"consumer_{uuid.uuid4().hex[:8]}"
+
+    @property
+    def consumer_id(self):
+        return self._consumer_id
 
     def __iter__(self):
-        while True:
-            table = ray.get(self._coordinator.get_batch.remote())
-            if table is None:
-                return
-            yield table
+        ray.get(self._coordinator.register_consumer.remote(self._consumer_id))
+        try:
+            while True:
+                result = ray.get(
+                    self._coordinator.pull_batch.remote(self._consumer_id)
+                )
+                if result is None:
+                    return
+                # Resolve partition refs to Arrow tables
+                tables = ray.get(result["partition_refs"])
+                for table in tables:
+                    yield table
+        finally:
+            ray.get(
+                self._coordinator.deregister_consumer.remote(self._consumer_id)
+            )
 
-    def iter_datasets(self, window_size):
-        window = []
-        for table in self:
-            window.append(ray.put(table))
-            if len(window) >= window_size:
-                yield ray.data.from_arrow_refs(window)
-                window = []
-        if window:  # flush remainder
-            yield ray.data.from_arrow_refs(window)
+    def iter_datasets(self, window_size: int):
+        """Yield ray.data.Dataset windows of `window_size` batches each."""
+        ray.get(self._coordinator.register_consumer.remote(self._consumer_id))
+        try:
+            window_refs = []
+            while True:
+                result = ray.get(
+                    self._coordinator.pull_batch.remote(self._consumer_id)
+                )
+                if result is None:
+                    break
+                window_refs.extend(result["partition_refs"])
+                if len(window_refs) >= window_size:
+                    yield ray.data.from_arrow_refs(window_refs)
+                    window_refs = []
+            if window_refs:
+                yield ray.data.from_arrow_refs(window_refs)
+        finally:
+            ray.get(
+                self._coordinator.deregister_consumer.remote(self._consumer_id)
+            )
