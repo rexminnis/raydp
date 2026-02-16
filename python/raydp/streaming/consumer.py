@@ -1,5 +1,5 @@
 import uuid
-from typing import Optional
+from typing import List, Optional
 
 import ray
 import ray.data
@@ -14,10 +14,12 @@ class StreamingIterator:
         ray.data.Dataset per window
     """
 
-    def __init__(self, coordinator, consumer_id: str = None, start_batch_id: Optional[int] = None):
+    def __init__(self, coordinator, consumer_id: str = None, start_batch_id: Optional[int] = None,
+                 partition_ids: Optional[List[int]] = None):
         self._coordinator = coordinator
         self._consumer_id = consumer_id or f"consumer_{uuid.uuid4().hex[:8]}"
         self._start_batch_id = start_batch_id
+        self._partition_ids = partition_ids
         self._last_batch_id: Optional[int] = None
 
     @property
@@ -31,7 +33,7 @@ class StreamingIterator:
 
     def __iter__(self):
         ray.get(self._coordinator.register_consumer.remote(
-            self._consumer_id, self._start_batch_id
+            self._consumer_id, self._start_batch_id, self._partition_ids
         ))
         try:
             while True:
@@ -53,7 +55,7 @@ class StreamingIterator:
     def iter_datasets(self, window_size: int):
         """Yield ray.data.Dataset windows of `window_size` batches each."""
         ray.get(self._coordinator.register_consumer.remote(
-            self._consumer_id, self._start_batch_id
+            self._consumer_id, self._start_batch_id, self._partition_ids
         ))
         try:
             window_refs = []

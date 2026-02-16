@@ -1,6 +1,6 @@
 import logging
 import uuid
-from typing import Optional
+from typing import List, Optional
 
 import pyarrow as pa
 import ray
@@ -18,8 +18,9 @@ class SparkStreamingSink:
     published to the coordinator as lightweight ObjectRefs.
     """
 
-    def __init__(self, stream_id: str = None, max_buffered_batches: int = 64):
+    def __init__(self, stream_id: str = None, max_buffered_batches: int = 64, partitioned: bool = False):
         self._stream_id = stream_id or f"stream_{uuid.uuid4().hex[:8]}"
+        self._partitioned = partitioned
         self._query = None
 
         actor_name = f"stream_coord_{self._stream_id}"
@@ -44,17 +45,36 @@ class SparkStreamingSink:
 
         watermark = self._extract_watermark()
 
-        pdf = batch_df.toPandas()
-        table = pa.Table.from_pandas(pdf)
-        ref = ray.put(table)
-
-        schema_bytes = table.schema.serialize().to_pybytes()
+        if self._partitioned:
+            tables = self._collect_partitions_as_arrow(batch_df)
+            refs = [ray.put(t) for t in tables]
+            schema_bytes = tables[0].schema.serialize().to_pybytes()
+            total_rows = sum(t.num_rows for t in tables)
+        else:
+            # Use PySpark 4.x native Arrow path — skips Pandas intermediate
+            table = batch_df.toArrow()
+            refs = [ray.put(table)]
+            schema_bytes = table.schema.serialize().to_pybytes()
+            total_rows = table.num_rows
 
         ray.get(
             self._coordinator.publish_batch.remote(
-                [ref], schema_bytes, table.num_rows, watermark
+                refs, schema_bytes, total_rows, watermark
             )
         )
+
+    def _collect_partitions_as_arrow(self, batch_df) -> List[pa.Table]:
+        """Collect each Spark partition as a separate Arrow table via JVM bridge."""
+        jvm = batch_df.sparkSession.sparkContext._jvm
+        helper = jvm.org.apache.spark.sql.Spark411SQLHelper
+        arrow_rdd = helper.toArrowBatchRdd(batch_df._jdf)
+        # collect() returns Java ArrayList of byte[] — one per Spark partition
+        java_partitions = arrow_rdd.toJavaRDD().collect()
+        tables = []
+        for ipc_bytes in java_partitions:
+            reader = pa.ipc.open_stream(pa.py_buffer(bytes(ipc_bytes)))
+            tables.append(reader.read_all())
+        return tables
 
     def stop(self):
         """Signal the coordinator that no more batches will arrive."""

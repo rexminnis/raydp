@@ -40,6 +40,8 @@ class StreamCoordinator:
 
         # Consumer cursors: consumer_id -> next batch_id to read
         self._consumers: Dict[str, int] = {}
+        # Partition assignments: consumer_id -> list of partition indices (None = all)
+        self._consumer_partitions: Dict[str, Optional[List[int]]] = {}
 
         # Signals
         self._complete = False
@@ -91,6 +93,12 @@ class StreamCoordinator:
             description="Total batches GC'd",
             tag_keys=("stream_id",),
         ).set_default_tags({"stream_id": stream_id})
+
+        self._m_consumer_lag = Gauge(
+            "raydp_stream_consumer_lag",
+            description="Batches behind head per consumer",
+            tag_keys=("stream_id", "consumer_id"),
+        )
 
     # -- Producer API --
 
@@ -155,12 +163,14 @@ class StreamCoordinator:
     # -- Consumer API --
 
     async def register_consumer(
-        self, consumer_id: str, start_batch_id: Optional[int] = None
+        self, consumer_id: str, start_batch_id: Optional[int] = None,
+        partition_ids: Optional[List[int]] = None,
     ) -> Optional[bytes]:
         """Register a consumer. Blocks until schema is available.
 
         Returns serialized schema bytes, or None if stream completed with no batches.
         If start_batch_id is provided, the consumer resumes from that batch offset.
+        If partition_ids is provided, pull_batch will only return those partition refs.
         """
         # Block until schema is available or stream ends
         while self._schema is None and not self._complete:
@@ -202,6 +212,7 @@ class StreamCoordinator:
             else:
                 self._consumers[consumer_id] = self._next_batch_id
 
+        self._consumer_partitions[consumer_id] = partition_ids
         return self._schema.serialize().to_pybytes()
 
     async def pull_batch(
@@ -225,10 +236,30 @@ class StreamCoordinator:
                 self._consumers[consumer_id] = cursor + 1
                 self._gc_batches()
                 self._m_pull_latency.observe((time.time() - pull_start) * 1000)
+
+                # Emit consumer lag
+                lag = self._next_batch_id - (cursor + 1)
+                self._m_consumer_lag.set(
+                    lag,
+                    {"stream_id": self._stream_id, "consumer_id": consumer_id},
+                )
+
+                # Filter partition refs if consumer has assigned partitions
+                assigned = self._consumer_partitions.get(consumer_id)
+                if assigned is not None:
+                    filtered_refs = [
+                        mb.partition_refs[i] for i in assigned
+                        if i < len(mb.partition_refs)
+                    ]
+                    filtered_rows = None
+                else:
+                    filtered_refs = mb.partition_refs
+                    filtered_rows = mb.num_rows
+
                 return {
                     "batch_id": mb.batch_id,
-                    "partition_refs": mb.partition_refs,
-                    "num_rows": mb.num_rows,
+                    "partition_refs": filtered_refs,
+                    "num_rows": filtered_rows,
                     "timestamp": mb.timestamp,
                     "watermark": mb.watermark,
                 }
@@ -254,6 +285,7 @@ class StreamCoordinator:
     async def deregister_consumer(self, consumer_id: str):
         """Remove a consumer and GC any batches it was holding back."""
         self._consumers.pop(consumer_id, None)
+        self._consumer_partitions.pop(consumer_id, None)
         self._gc_batches()
 
     # -- Drain --

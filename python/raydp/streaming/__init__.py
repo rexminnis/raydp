@@ -1,11 +1,13 @@
 import logging
 import uuid
+from typing import List
 
 import ray
 
 from raydp.streaming.coordinator import StreamCoordinator
 from raydp.streaming.consumer import StreamingIterator
 from raydp.streaming.sink import SparkStreamingSink
+from raydp.streaming.monitor import print_stats
 
 logger = logging.getLogger(__name__)
 
@@ -89,9 +91,34 @@ class _StreamingQueryWrapper:
         return getattr(self._query, name)
 
 
+def create_partitioned_iterators(
+    coordinator, num_consumers: int, num_partitions: int,
+) -> List[StreamingIterator]:
+    """Create N StreamingIterators with round-robin partition assignment.
+
+    Args:
+        coordinator: StreamCoordinator actor handle.
+        num_consumers: Number of consumers to create.
+        num_partitions: Total partitions per batch.
+
+    Returns:
+        List of StreamingIterators with disjoint partition assignments.
+    """
+    partitions_per_consumer: List[List[int]] = [[] for _ in range(num_consumers)]
+    for p in range(num_partitions):
+        partitions_per_consumer[p % num_consumers].append(p)
+
+    return [
+        StreamingIterator(coordinator, partition_ids=parts)
+        for parts in partitions_per_consumer
+    ]
+
+
 __all__ = [
     "StreamCoordinator",
     "SparkStreamingSink",
     "StreamingIterator",
     "from_spark_streaming",
+    "create_partitioned_iterators",
+    "print_stats",
 ]

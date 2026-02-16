@@ -2,6 +2,7 @@
 
 import threading
 import time
+from io import StringIO
 
 import pyarrow as pa
 import pytest
@@ -10,6 +11,8 @@ import ray
 from raydp.streaming.coordinator import StreamCoordinator
 from raydp.streaming.consumer import StreamingIterator
 from raydp.streaming.sink import SparkStreamingSink
+from raydp.streaming.monitor import print_stats
+from raydp.streaming import create_partitioned_iterators
 
 
 # ---------------------------------------------------------------------------
@@ -536,6 +539,134 @@ class TestMetricsSmoke:
         stats = ray.get(coord.get_stats.remote())
         assert stats["batches_published"] == 3
         assert stats["complete"] is True
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 unit tests — partitioned pull, monitor
+# ---------------------------------------------------------------------------
+
+def _publish_multi_ref(coordinator, tables):
+    """Publish multiple Arrow table refs as a single batch (simulating partitioned mode)."""
+    refs = [ray.put(t) for t in tables]
+    schema_bytes = _schema_bytes(tables[0])
+    total_rows = sum(t.num_rows for t in tables)
+    ray.get(coordinator.publish_batch.remote(refs, schema_bytes, total_rows))
+
+
+class TestPartitionedPullReturnsSubset:
+
+    def test_partitioned_pull_returns_subset(self, ray_env):
+        """Publish batch with 4 refs, register consumer with partition_ids=[0,2],
+        verify only refs 0 and 2 returned."""
+        coord = StreamCoordinator.remote(stream_id="test_part_sub", max_buffered_batches=10)
+        tables = [_make_table(3, i) for i in range(4)]
+        _publish_multi_ref(coord, tables)
+        ray.get(coord.signal_complete.remote())
+
+        ray.get(coord.register_consumer.remote("c1", partition_ids=[0, 2]))
+        result = ray.get(coord.pull_batch.remote("c1"))
+        assert result is not None
+        resolved = ray.get(result["partition_refs"])
+        assert len(resolved) == 2
+        assert resolved[0].equals(tables[0])
+        assert resolved[1].equals(tables[2])
+        ray.get(coord.deregister_consumer.remote("c1"))
+
+
+class TestPartitionedTwoConsumersDisjoint:
+
+    def test_partitioned_two_consumers_disjoint(self, ray_env):
+        """Two consumers with disjoint partition_ids each get only their assigned refs."""
+        coord = StreamCoordinator.remote(stream_id="test_part_disj", max_buffered_batches=10)
+        tables = [_make_table(3, i) for i in range(4)]
+        _publish_multi_ref(coord, tables)
+        ray.get(coord.signal_complete.remote())
+
+        ray.get(coord.register_consumer.remote("c1", partition_ids=[0, 1]))
+        ray.get(coord.register_consumer.remote("c2", partition_ids=[2, 3]))
+
+        r1 = ray.get(coord.pull_batch.remote("c1"))
+        r2 = ray.get(coord.pull_batch.remote("c2"))
+
+        resolved1 = ray.get(r1["partition_refs"])
+        resolved2 = ray.get(r2["partition_refs"])
+
+        assert len(resolved1) == 2
+        assert resolved1[0].equals(tables[0])
+        assert resolved1[1].equals(tables[1])
+
+        assert len(resolved2) == 2
+        assert resolved2[0].equals(tables[2])
+        assert resolved2[1].equals(tables[3])
+
+        ray.get(coord.deregister_consumer.remote("c1"))
+        ray.get(coord.deregister_consumer.remote("c2"))
+
+
+class TestPartitionedIgnoresOutOfRange:
+
+    def test_partitioned_pull_ignores_out_of_range(self, ray_env):
+        """partition_ids=[5] with only 3 refs returns empty list (no crash)."""
+        coord = StreamCoordinator.remote(stream_id="test_part_oor", max_buffered_batches=10)
+        tables = [_make_table(3, i) for i in range(3)]
+        _publish_multi_ref(coord, tables)
+        ray.get(coord.signal_complete.remote())
+
+        ray.get(coord.register_consumer.remote("c1", partition_ids=[5]))
+        result = ray.get(coord.pull_batch.remote("c1"))
+        assert result is not None
+        assert len(result["partition_refs"]) == 0
+        ray.get(coord.deregister_consumer.remote("c1"))
+
+
+class TestFanOutDefaultUnchanged:
+
+    def test_fan_out_default_unchanged(self, ray_env):
+        """Register without partition_ids, verify all refs returned (backward compat)."""
+        coord = StreamCoordinator.remote(stream_id="test_fanout", max_buffered_batches=10)
+        tables = [_make_table(3, i) for i in range(4)]
+        _publish_multi_ref(coord, tables)
+        ray.get(coord.signal_complete.remote())
+
+        ray.get(coord.register_consumer.remote("c1"))
+        result = ray.get(coord.pull_batch.remote("c1"))
+        assert result is not None
+        resolved = ray.get(result["partition_refs"])
+        assert len(resolved) == 4
+        for i, t in enumerate(resolved):
+            assert t.equals(tables[i])
+        assert result["num_rows"] == sum(t.num_rows for t in tables)
+        ray.get(coord.deregister_consumer.remote("c1"))
+
+
+class TestCreatePartitionedIteratorsFactory:
+
+    def test_create_partitioned_iterators_factory(self, ray_env):
+        """Verify round-robin partition assignment."""
+        coord = StreamCoordinator.remote(stream_id="test_factory", max_buffered_batches=10)
+
+        iterators = create_partitioned_iterators(coord, num_consumers=3, num_partitions=7)
+        assert len(iterators) == 3
+        # Partitions: 0,3,6 | 1,4 | 2,5
+        assert iterators[0]._partition_ids == [0, 3, 6]
+        assert iterators[1]._partition_ids == [1, 4]
+        assert iterators[2]._partition_ids == [2, 5]
+
+
+class TestPrintStatsSmoke:
+
+    def test_print_stats_smoke(self, ray_env, capsys):
+        """Verify print_stats runs one iteration without error."""
+        coord = StreamCoordinator.remote(stream_id="test_monitor", max_buffered_batches=10)
+        _publish_table(coord, _make_table(5, 0))
+        ray.get(coord.signal_complete.remote())
+
+        print_stats(coord, interval=0.1, max_iterations=1)
+
+        captured = capsys.readouterr()
+        assert "test_monitor" in captured.out
+        assert "published=1" in captured.out
+        assert "complete=True" in captured.out
 
 
 # ---------------------------------------------------------------------------
