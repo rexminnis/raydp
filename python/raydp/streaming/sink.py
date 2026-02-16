@@ -14,8 +14,20 @@ class SparkStreamingSink:
     """Bridges Spark Structured Streaming to a StreamCoordinator.
 
     Used as a foreachBatch sink: each micro-batch DataFrame is converted to
-    an Arrow table via toPandas(), put into the Ray object store, and
-    published to the coordinator as lightweight ObjectRefs.
+    an Arrow table via toArrow() (PySpark 4.x native path), put into the Ray
+    object store, and published to the coordinator as lightweight ObjectRefs.
+
+    Thread safety: Spark's micro-batch engine serializes foreachBatch calls —
+    the next micro-batch does not start until process_batch returns. This
+    means process_batch (and the JVM bridge in partitioned mode) is never
+    called concurrently, so no additional synchronization is needed.
+
+    Arrow fast-path: Both toArrow() and Spark411SQLHelper.toArrowBatchRdd()
+    respect the Spark session config. RayDP sets lz4 compression
+    (spark.sql.execution.arrow.compression.codec) and unlimited batch size
+    (spark.sql.execution.arrow.maxRecordsPerBatch=0) by default in
+    ray_cluster.py, so the streaming path inherits these optimizations
+    automatically.
     """
 
     def __init__(self, stream_id: str = None, max_buffered_batches: int = 64, partitioned: bool = False):

@@ -541,6 +541,28 @@ class TestMetricsSmoke:
         assert stats["complete"] is True
 
 
+class TestSchemaMismatchRaises:
+
+    def test_schema_mismatch_raises(self, ray_env):
+        """Publishing a batch with a different schema should raise ValueError."""
+        coord = StreamCoordinator.remote(stream_id="test_schema_mismatch", max_buffered_batches=10)
+
+        # First batch: (id: int64, value: float64)
+        _publish_table(coord, _make_table(3, 0))
+
+        # Second batch: different schema (name: string, count: int64)
+        bad_table = pa.table({
+            "name": pa.array(["a", "b"], type=pa.string()),
+            "count": pa.array([1, 2], type=pa.int64()),
+        })
+        ref = ray.put(bad_table)
+        with pytest.raises(ray.exceptions.RayTaskError) as exc_info:
+            ray.get(coord.publish_batch.remote(
+                [ref], _schema_bytes(bad_table), bad_table.num_rows
+            ))
+        assert "Schema mismatch" in str(exc_info.value)
+
+
 # ---------------------------------------------------------------------------
 # Phase 3 unit tests — partitioned pull, monitor
 # ---------------------------------------------------------------------------

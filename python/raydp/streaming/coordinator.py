@@ -121,6 +121,15 @@ class StreamCoordinator:
         if self._schema is None:
             self._schema = schema
             self._schema_available.set()
+        elif not self._schema.equals(schema):
+            raise ValueError(
+                f"Schema mismatch on batch {self._next_batch_id}: "
+                f"stream schema has {self._schema}, "
+                f"but batch has {schema}. "
+                f"Spark Structured Streaming does not support schema "
+                f"evolution within a query — restart the stream if the "
+                f"schema has changed."
+            )
 
         batch_id = self._next_batch_id
         self._next_batch_id += 1
@@ -305,7 +314,15 @@ class StreamCoordinator:
     # -- Internal --
 
     def _gc_batches(self):
-        """Remove batches that all consumers have already read."""
+        """Remove batches that all consumers have already read.
+
+        Dropping the MicroBatch from the buffer releases the coordinator's
+        reference to the ObjectRefs. The actual object store memory is freed
+        by Ray's reference counting once consumers also drop their refs
+        (after ray.get). We intentionally do NOT call ray.internal.free()
+        here because consumers may still hold unresolved ObjectRefs returned
+        by pull_batch.
+        """
         if not self._consumers:
             return
         min_cursor = min(self._consumers.values())
