@@ -92,6 +92,7 @@ class StreamCoordinator:
     async def signal_error(self, error_msg: str):
         """Signal an error to all consumers."""
         self._error = error_msg
+        self._complete = True
         self._batch_available.set()  # wake any waiting consumers
 
     # -- Consumer API --

@@ -297,3 +297,67 @@ def test_streaming_end_to_end(spark_on_ray_small):
     coord = ray.get_actor(f"stream_coord_e2e_test")
     stats = ray.get(coord.get_stats.remote())
     assert stats["buffer_size"] <= 4
+
+
+@pytest.mark.parametrize("spark_on_ray_small", ["local"], indirect=True)
+def test_streaming_iter_datasets_end_to_end(spark_on_ray_small):
+    """Spark rate source → from_spark_streaming() → iter_datasets → verify windowing."""
+    from raydp.streaming import from_spark_streaming
+
+    spark = spark_on_ray_small
+
+    # Wait for executors
+    time.sleep(10)
+
+    rate_stream = (
+        spark.readStream
+        .format("rate")
+        .option("rowsPerSecond", "10")
+        .load()
+    )
+
+    iterator, query = from_spark_streaming(
+        rate_stream,
+        stream_id="e2e_ds_test",
+        max_buffered_batches=8,
+        trigger={"processingTime": "2 seconds"},
+    )
+
+    # Consume windowed datasets in a thread
+    collected_datasets = []
+    consumer_error = None
+    window_size = 3
+
+    def consumer_fn():
+        nonlocal consumer_error
+        try:
+            for ds in iterator.iter_datasets(window_size=window_size):
+                collected_datasets.append(ds)
+                if len(collected_datasets) >= 2:
+                    return
+        except Exception as e:
+            consumer_error = e
+
+    t = threading.Thread(target=consumer_fn, daemon=True)
+    t.start()
+
+    # Wait for at least 2 windowed datasets
+    deadline = time.time() + 60
+    while len(collected_datasets) < 2 and time.time() < deadline:
+        time.sleep(1)
+
+    query.stop()
+    t.join(timeout=10)
+
+    assert consumer_error is None, f"Consumer error: {consumer_error}"
+    assert len(collected_datasets) >= 2, (
+        f"Expected 2+ datasets, got {len(collected_datasets)}"
+    )
+
+    # Each dataset should be a real ray.data.Dataset with rows from multiple batches
+    for ds in collected_datasets:
+        count = ds.count()
+        assert count > 0, "Dataset should have rows"
+        schema_names = ds.schema().names
+        assert "timestamp" in schema_names
+        assert "value" in schema_names
