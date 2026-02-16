@@ -1,8 +1,13 @@
+import logging
 import uuid
+
+import ray
 
 from raydp.streaming.coordinator import StreamCoordinator
 from raydp.streaming.consumer import StreamingIterator
 from raydp.streaming.sink import SparkStreamingSink
+
+logger = logging.getLogger(__name__)
 
 
 def from_spark_streaming(
@@ -43,6 +48,8 @@ def from_spark_streaming(
         writer = writer.option("checkpointLocation", checkpoint_location)
 
     raw_query = writer.start()
+    sink.set_query(raw_query)
+
     query = _StreamingQueryWrapper(raw_query, sink)
     iterator = StreamingIterator(sink.coordinator)
 
@@ -56,9 +63,27 @@ class _StreamingQueryWrapper:
         self._query = query
         self._sink = sink
 
-    def stop(self):
-        self._query.stop()
-        self._sink.stop()
+    def stop(self, drain_timeout=30.0):
+        self._query.stop()           # 1. Stop Spark (no more batches)
+        self._sink.stop()             # 2. signal_complete on coordinator
+
+        # 3. Wait for consumers to drain
+        coordinator = self._sink.coordinator
+        try:
+            drained = ray.get(coordinator.wait_for_drain.remote(timeout=drain_timeout))
+            if not drained:
+                logger.warning(
+                    "Stream %s: not all consumers drained within %.1fs",
+                    self._sink.stream_id, drain_timeout,
+                )
+        except Exception:
+            pass
+
+        # 4. Kill detached actor
+        try:
+            ray.kill(coordinator)
+        except Exception:
+            pass
 
     def __getattr__(self, name):
         return getattr(self._query, name)

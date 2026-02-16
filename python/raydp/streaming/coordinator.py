@@ -6,6 +6,7 @@ from typing import Dict, List, Optional
 
 import pyarrow as pa
 import ray
+from ray.util.metrics import Counter, Gauge, Histogram
 
 
 @dataclass
@@ -15,6 +16,7 @@ class MicroBatch:
     schema: pa.Schema
     num_rows: int
     timestamp: float
+    watermark: Optional[str] = None  # ISO8601 UTC string from Spark
 
 
 @ray.remote
@@ -48,17 +50,60 @@ class StreamCoordinator:
 
         # Schema from first batch
         self._schema: Optional[pa.Schema] = None
+        self._schema_available = asyncio.Event()
+
+        # Watermark
+        self._latest_watermark: Optional[str] = None
 
         # Stats
         self._batches_published = 0
         self._batches_gc = 0
 
+        # Ray metrics
+        self._m_published = Counter(
+            "raydp_stream_batches_published",
+            description="Total batches published",
+            tag_keys=("stream_id",),
+        ).set_default_tags({"stream_id": stream_id})
+
+        self._m_buffer_size = Gauge(
+            "raydp_stream_buffer_size",
+            description="Current buffered batches",
+            tag_keys=("stream_id",),
+        ).set_default_tags({"stream_id": stream_id})
+
+        self._m_publish_latency = Histogram(
+            "raydp_stream_publish_latency_ms",
+            description="Publish latency (ms)",
+            boundaries=[1, 5, 10, 50, 100, 500, 1000, 5000],
+            tag_keys=("stream_id",),
+        ).set_default_tags({"stream_id": stream_id})
+
+        self._m_pull_latency = Histogram(
+            "raydp_stream_pull_latency_ms",
+            description="Pull wait time (ms)",
+            boundaries=[1, 5, 10, 50, 100, 500, 1000, 5000],
+            tag_keys=("stream_id",),
+        ).set_default_tags({"stream_id": stream_id})
+
+        self._m_gc = Counter(
+            "raydp_stream_batches_gc",
+            description="Total batches GC'd",
+            tag_keys=("stream_id",),
+        ).set_default_tags({"stream_id": stream_id})
+
     # -- Producer API --
 
     async def publish_batch(
-        self, partition_refs: List[ray.ObjectRef], schema_bytes: bytes, num_rows: int
+        self,
+        partition_refs: List[ray.ObjectRef],
+        schema_bytes: bytes,
+        num_rows: int,
+        watermark: Optional[str] = None,
     ) -> int:
         """Publish a batch of Arrow table refs. Blocks when buffer is full."""
+        publish_start = time.time()
+
         # Wait for space
         while len(self._buffer) >= self._max_buffered:
             self._space_available.clear()
@@ -67,9 +112,13 @@ class StreamCoordinator:
         schema = pa.ipc.read_schema(pa.py_buffer(schema_bytes))
         if self._schema is None:
             self._schema = schema
+            self._schema_available.set()
 
         batch_id = self._next_batch_id
         self._next_batch_id += 1
+
+        if watermark is not None:
+            self._latest_watermark = watermark
 
         self._buffer[batch_id] = MicroBatch(
             batch_id=batch_id,
@@ -77,8 +126,14 @@ class StreamCoordinator:
             schema=schema,
             num_rows=num_rows,
             timestamp=time.time(),
+            watermark=watermark,
         )
         self._batches_published += 1
+
+        # Metrics
+        self._m_published.inc()
+        self._m_buffer_size.set(len(self._buffer))
+        self._m_publish_latency.observe((time.time() - publish_start) * 1000)
 
         # Signal waiting consumers
         self._batch_available.set()
@@ -87,32 +142,76 @@ class StreamCoordinator:
     async def signal_complete(self):
         """Signal that no more batches will be produced."""
         self._complete = True
+        self._schema_available.set()  # unblock register_consumer if waiting
         self._batch_available.set()  # wake any waiting consumers
 
     async def signal_error(self, error_msg: str):
         """Signal an error to all consumers."""
         self._error = error_msg
         self._complete = True
+        self._schema_available.set()  # unblock register_consumer if waiting
         self._batch_available.set()  # wake any waiting consumers
 
     # -- Consumer API --
 
-    async def register_consumer(self, consumer_id: str) -> Optional[bytes]:
-        """Register a consumer. Returns serialized schema bytes (or None if no batches yet)."""
-        # Cursor starts at the earliest available batch
-        if self._buffer:
-            first_key = next(iter(self._buffer))
-            self._consumers[consumer_id] = first_key
-        else:
-            self._consumers[consumer_id] = self._next_batch_id
-        if self._schema is not None:
-            return self._schema.serialize().to_pybytes()
-        return None
+    async def register_consumer(
+        self, consumer_id: str, start_batch_id: Optional[int] = None
+    ) -> Optional[bytes]:
+        """Register a consumer. Blocks until schema is available.
 
-    async def pull_batch(self, consumer_id: str) -> Optional[dict]:
-        """Pull the next batch for this consumer. Returns None when stream is done."""
+        Returns serialized schema bytes, or None if stream completed with no batches.
+        If start_batch_id is provided, the consumer resumes from that batch offset.
+        """
+        # Block until schema is available or stream ends
+        while self._schema is None and not self._complete:
+            self._schema_available.clear()
+            if self._schema is not None or self._complete:
+                break
+            await self._schema_available.wait()
+
+        # If error was signaled, raise
+        if self._error is not None:
+            raise RuntimeError(f"Stream error: {self._error}")
+
+        # Stream completed with no data
+        if self._schema is None:
+            return None
+
+        # Set cursor
+        if start_batch_id is not None:
+            # Validate start_batch_id is not GC'd
+            if self._buffer:
+                first_buffered = next(iter(self._buffer))
+                if start_batch_id < first_buffered:
+                    raise ValueError(
+                        f"start_batch_id {start_batch_id} has been GC'd "
+                        f"(earliest buffered: {first_buffered})"
+                    )
+            elif start_batch_id < self._next_batch_id:
+                # Buffer is empty — all past batches were GC'd
+                raise ValueError(
+                    f"start_batch_id {start_batch_id} has been GC'd "
+                    f"(all {self._next_batch_id} batches consumed and GC'd)"
+                )
+            self._consumers[consumer_id] = start_batch_id
+        else:
+            # Cursor starts at the earliest available batch
+            if self._buffer:
+                first_key = next(iter(self._buffer))
+                self._consumers[consumer_id] = first_key
+            else:
+                self._consumers[consumer_id] = self._next_batch_id
+
+        return self._schema.serialize().to_pybytes()
+
+    async def pull_batch(
+        self, consumer_id: str, timeout: Optional[float] = None
+    ) -> Optional[dict]:
+        """Pull the next batch for this consumer. Returns None when stream is done or on timeout."""
         if consumer_id not in self._consumers:
             raise ValueError(f"Unknown consumer: {consumer_id}")
+
+        pull_start = time.time()
 
         while True:
             # Check for error
@@ -125,11 +224,13 @@ class StreamCoordinator:
                 mb = self._buffer[cursor]
                 self._consumers[consumer_id] = cursor + 1
                 self._gc_batches()
+                self._m_pull_latency.observe((time.time() - pull_start) * 1000)
                 return {
                     "batch_id": mb.batch_id,
                     "partition_refs": mb.partition_refs,
                     "num_rows": mb.num_rows,
                     "timestamp": mb.timestamp,
+                    "watermark": mb.watermark,
                 }
 
             # No batch at cursor — either stream is done or we need to wait
@@ -145,12 +246,29 @@ class StreamCoordinator:
                 or self._error is not None
             ):
                 continue
-            await self._batch_available.wait()
+            try:
+                await asyncio.wait_for(self._batch_available.wait(), timeout=timeout)
+            except asyncio.TimeoutError:
+                return None
 
     async def deregister_consumer(self, consumer_id: str):
         """Remove a consumer and GC any batches it was holding back."""
         self._consumers.pop(consumer_id, None)
         self._gc_batches()
+
+    # -- Drain --
+
+    async def wait_for_drain(self, timeout: float = 30.0) -> bool:
+        """Wait until all consumers have consumed all batches. Returns False on timeout."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if not self._consumers:
+                return True
+            all_drained = all(c >= self._next_batch_id for c in self._consumers.values())
+            if all_drained:
+                return True
+            await asyncio.sleep(0.1)
+        return False
 
     # -- Internal --
 
@@ -163,10 +281,16 @@ class StreamCoordinator:
         for bid in to_remove:
             del self._buffer[bid]
             self._batches_gc += 1
+            self._m_gc.inc()
+        if to_remove:
+            self._m_buffer_size.set(len(self._buffer))
         if len(self._buffer) < self._max_buffered:
             self._space_available.set()
 
     # -- Observability --
+
+    async def get_watermark(self) -> Optional[str]:
+        return self._latest_watermark
 
     async def get_stats(self) -> dict:
         return {
@@ -179,4 +303,5 @@ class StreamCoordinator:
             "consumer_cursors": dict(self._consumers),
             "complete": self._complete,
             "error": self._error,
+            "latest_watermark": self._latest_watermark,
         }
