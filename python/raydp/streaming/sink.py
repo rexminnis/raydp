@@ -30,7 +30,8 @@ class SparkStreamingSink:
     automatically.
     """
 
-    def __init__(self, stream_id: str = None, max_buffered_batches: int = 64, partitioned: bool = False):
+    def __init__(self, stream_id: str = None, max_buffered_batches: int = 64,
+                 max_buffered_bytes: int = 2 * 1024**3, partitioned: bool = False):
         self._stream_id = stream_id or f"stream_{uuid.uuid4().hex[:8]}"
         self._partitioned = partitioned
         self._query = None
@@ -44,6 +45,7 @@ class SparkStreamingSink:
             ).remote(
                 stream_id=self._stream_id,
                 max_buffered_batches=max_buffered_batches,
+                max_buffered_bytes=max_buffered_bytes,
             )
 
     def set_query(self, query):
@@ -59,19 +61,25 @@ class SparkStreamingSink:
 
         if self._partitioned:
             tables = self._collect_partitions_as_arrow(batch_df)
-            refs = [ray.put(t) for t in tables]
+            # _owner transfers object lifetime to the detached coordinator actor,
+            # so objects survive if the Spark driver crashes. This is an underscore-
+            # prefixed Ray API, stable since Ray 2.x; falling back to driver
+            # ownership (the default) is safe if Ray removes it in a future version.
+            refs = [ray.put(t, _owner=self._coordinator) for t in tables]
             schema_bytes = tables[0].schema.serialize().to_pybytes()
             total_rows = sum(t.num_rows for t in tables)
+            total_bytes = sum(t.nbytes for t in tables)
         else:
             # Use PySpark 4.x native Arrow path — skips Pandas intermediate
             table = batch_df.toArrow()
-            refs = [ray.put(table)]
+            refs = [ray.put(table, _owner=self._coordinator)]
             schema_bytes = table.schema.serialize().to_pybytes()
             total_rows = table.num_rows
+            total_bytes = table.nbytes
 
         ray.get(
             self._coordinator.publish_batch.remote(
-                refs, schema_bytes, total_rows, watermark
+                refs, schema_bytes, total_rows, watermark, num_bytes=total_bytes,
             )
         )
 

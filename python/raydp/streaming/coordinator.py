@@ -15,6 +15,7 @@ class MicroBatch:
     partition_refs: List[ray.ObjectRef]
     schema: pa.Schema
     num_rows: int
+    num_bytes: int
     timestamp: float
     watermark: Optional[str] = None  # ISO8601 UTC string from Spark
 
@@ -30,9 +31,12 @@ class StreamCoordinator:
     publish_batch concurrently — a sync actor would deadlock.
     """
 
-    def __init__(self, stream_id: str, max_buffered_batches: int = 64):
+    def __init__(self, stream_id: str, max_buffered_batches: int = 64,
+                 max_buffered_bytes: int = 2 * 1024**3):
         self._stream_id = stream_id
         self._max_buffered = max_buffered_batches
+        self._max_bytes = max_buffered_bytes
+        self._buffered_bytes = 0
 
         # Ordered buffer: batch_id -> MicroBatch
         self._buffer: OrderedDict[int, MicroBatch] = OrderedDict()
@@ -94,6 +98,12 @@ class StreamCoordinator:
             tag_keys=("stream_id",),
         ).set_default_tags({"stream_id": stream_id})
 
+        self._m_buffered_bytes = Gauge(
+            "raydp_stream_buffered_bytes",
+            description="Current buffered bytes in object store",
+            tag_keys=("stream_id",),
+        ).set_default_tags({"stream_id": stream_id})
+
         self._m_consumer_lag = Gauge(
             "raydp_stream_consumer_lag",
             description="Batches behind head per consumer",
@@ -108,12 +118,15 @@ class StreamCoordinator:
         schema_bytes: bytes,
         num_rows: int,
         watermark: Optional[str] = None,
+        num_bytes: int = 0,
     ) -> int:
         """Publish a batch of Arrow table refs. Blocks when buffer is full."""
         publish_start = time.time()
 
-        # Wait for space
-        while len(self._buffer) >= self._max_buffered:
+        # Wait for space (batch count OR byte budget)
+        while (len(self._buffer) >= self._max_buffered
+               or (self._buffered_bytes >= self._max_bytes
+                   and len(self._buffer) > 0)):
             self._space_available.clear()
             await self._space_available.wait()
 
@@ -142,14 +155,17 @@ class StreamCoordinator:
             partition_refs=partition_refs,
             schema=schema,
             num_rows=num_rows,
+            num_bytes=num_bytes,
             timestamp=time.time(),
             watermark=watermark,
         )
+        self._buffered_bytes += num_bytes
         self._batches_published += 1
 
         # Metrics
         self._m_published.inc()
         self._m_buffer_size.set(len(self._buffer))
+        self._m_buffered_bytes.set(self._buffered_bytes)
         self._m_publish_latency.observe((time.time() - publish_start) * 1000)
 
         # Signal waiting consumers
@@ -328,12 +344,15 @@ class StreamCoordinator:
         min_cursor = min(self._consumers.values())
         to_remove = [bid for bid in self._buffer if bid < min_cursor]
         for bid in to_remove:
+            self._buffered_bytes -= self._buffer[bid].num_bytes
             del self._buffer[bid]
             self._batches_gc += 1
             self._m_gc.inc()
         if to_remove:
             self._m_buffer_size.set(len(self._buffer))
-        if len(self._buffer) < self._max_buffered:
+            self._m_buffered_bytes.set(self._buffered_bytes)
+        if (len(self._buffer) < self._max_buffered
+                and self._buffered_bytes < self._max_bytes):
             self._space_available.set()
 
     # -- Observability --
@@ -348,6 +367,8 @@ class StreamCoordinator:
             "batches_gc": self._batches_gc,
             "buffer_size": len(self._buffer),
             "max_buffered": self._max_buffered,
+            "buffered_bytes": self._buffered_bytes,
+            "max_buffered_bytes": self._max_bytes,
             "num_consumers": len(self._consumers),
             "consumer_cursors": dict(self._consumers),
             "complete": self._complete,

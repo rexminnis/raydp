@@ -33,7 +33,9 @@ def _schema_bytes(table: pa.Table) -> bytes:
 def _publish_table(coordinator, table: pa.Table):
     """Put table in object store and publish ref to coordinator."""
     ref = ray.put(table)
-    ray.get(coordinator.publish_batch.remote([ref], _schema_bytes(table), table.num_rows))
+    ray.get(coordinator.publish_batch.remote(
+        [ref], _schema_bytes(table), table.num_rows, num_bytes=table.nbytes,
+    ))
 
 
 # ---------------------------------------------------------------------------
@@ -572,7 +574,10 @@ def _publish_multi_ref(coordinator, tables):
     refs = [ray.put(t) for t in tables]
     schema_bytes = _schema_bytes(tables[0])
     total_rows = sum(t.num_rows for t in tables)
-    ray.get(coordinator.publish_batch.remote(refs, schema_bytes, total_rows))
+    total_bytes = sum(t.nbytes for t in tables)
+    ray.get(coordinator.publish_batch.remote(
+        refs, schema_bytes, total_rows, num_bytes=total_bytes,
+    ))
 
 
 class TestPartitionedPullReturnsSubset:
@@ -689,6 +694,81 @@ class TestPrintStatsSmoke:
         assert "test_monitor" in captured.out
         assert "published=1" in captured.out
         assert "complete=True" in captured.out
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 unit tests — byte-based backpressure
+# ---------------------------------------------------------------------------
+
+class TestByteBackpressure:
+
+    def test_byte_limit_triggers_backpressure(self, ray_env):
+        """Backpressure should trigger when byte limit is reached, even if batch
+        count is under the limit."""
+        table = _make_table(100, 0)
+        table_bytes = table.nbytes  # ~1600 bytes for 100 rows of (int64, float64)
+
+        # Set byte budget to 2× one table — third publish should block
+        coord = StreamCoordinator.remote(
+            stream_id="test_byte_bp",
+            max_buffered_batches=100,  # high batch limit — won't be the bottleneck
+            max_buffered_bytes=table_bytes * 2,
+        )
+
+        _publish_table(coord, _make_table(100, 0))
+        ray.get(coord.register_consumer.remote("c1"))
+        _publish_table(coord, _make_table(100, 1))
+
+        # Buffer: 2 batches, ~2× table_bytes — at byte limit
+        published = threading.Event()
+
+        def producer():
+            _publish_table(coord, _make_table(100, 2))
+            published.set()
+
+        t = threading.Thread(target=producer, daemon=True)
+        t.start()
+        time.sleep(0.5)
+        assert not published.is_set(), "Producer should be blocked by byte backpressure"
+
+        # Pull one batch to free bytes
+        ray.get(coord.pull_batch.remote("c1"))
+        t.join(timeout=5)
+        assert published.is_set(), "Producer should unblock after consumer frees bytes"
+        ray.get(coord.deregister_consumer.remote("c1"))
+
+
+class TestByteTrackingInStats:
+
+    def test_buffered_bytes_in_stats(self, ray_env):
+        """buffered_bytes in stats should increase on publish and decrease on GC."""
+        coord = StreamCoordinator.remote(
+            stream_id="test_byte_stats",
+            max_buffered_batches=100,
+        )
+
+        table = _make_table(50, 0)
+        expected_bytes = table.nbytes
+
+        _publish_table(coord, table)
+        stats = ray.get(coord.get_stats.remote())
+        assert stats["buffered_bytes"] == expected_bytes
+        assert stats["max_buffered_bytes"] == 2 * 1024**3
+
+        _publish_table(coord, _make_table(50, 1))
+        stats = ray.get(coord.get_stats.remote())
+        assert stats["buffered_bytes"] == expected_bytes * 2
+
+        # Register consumer and consume both → GC should free bytes
+        ray.get(coord.register_consumer.remote("c1"))
+        ray.get(coord.pull_batch.remote("c1"))
+        ray.get(coord.pull_batch.remote("c1"))
+
+        stats = ray.get(coord.get_stats.remote())
+        assert stats["buffered_bytes"] == 0
+        assert stats["buffer_size"] == 0
+
+        ray.get(coord.deregister_consumer.remote("c1"))
 
 
 # ---------------------------------------------------------------------------

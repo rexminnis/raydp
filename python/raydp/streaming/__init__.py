@@ -16,6 +16,7 @@ def from_spark_streaming(
     streaming_df,
     stream_id=None,
     max_buffered_batches=64,
+    max_buffered_bytes=2 * 1024**3,
     trigger=None,
     checkpoint_location=None,
 ):
@@ -32,6 +33,8 @@ def from_spark_streaming(
         Unique identifier for the stream. Auto-generated if not provided.
     max_buffered_batches : int
         Maximum number of micro-batches buffered before backpressure.
+    max_buffered_bytes : int
+        Maximum total bytes buffered before backpressure (default 2 GB).
     trigger : dict, optional
         Spark trigger config, e.g. {"processingTime": "2 seconds"}.
     checkpoint_location : str, optional
@@ -39,7 +42,8 @@ def from_spark_streaming(
     """
     stream_id = stream_id or f"stream_{uuid.uuid4().hex[:8]}"
     sink = SparkStreamingSink(
-        stream_id=stream_id, max_buffered_batches=max_buffered_batches
+        stream_id=stream_id, max_buffered_batches=max_buffered_batches,
+        max_buffered_bytes=max_buffered_bytes,
     )
 
     writer = streaming_df.writeStream.foreachBatch(sink.process_batch)
