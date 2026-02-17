@@ -6,7 +6,7 @@ from ray.cluster_utils import Cluster
 from ray.util.state import list_actors
 
 
-def test_spark_master_memory_custom(jdk17_extra_spark_configs):
+def test_spark_master_memory_custom():
     cluster = Cluster(
         initialize_head=True,
         head_node_args={
@@ -19,11 +19,12 @@ def test_spark_master_memory_custom(jdk17_extra_spark_configs):
     ray.init(address=cluster.address)
 
     custom_memory = 100 * 1024 * 1024  # 100MB in bytes
-    configs = jdk17_extra_spark_configs.copy()
-    # Config under test: set Spark Master actor memory via RayDP config
-    configs["spark.ray.raydp_spark_master.actor.resource.memory"] = str(custom_memory)
-    # Also require the master custom resource so the actor is scheduled on the head
-    configs["spark.ray.raydp_spark_master.actor.resource.master"] = "1"
+    configs = {
+        # Config under test: set Spark Master actor memory via RayDP config
+        "spark.ray.raydp_spark_master.actor.resource.memory": str(custom_memory),
+        # Also require the master custom resource so the actor is scheduled on the head
+        "spark.ray.raydp_spark_master.actor.resource.master": "1",
+    }
 
     app_name = "test_spark_master_memory_custom"
 

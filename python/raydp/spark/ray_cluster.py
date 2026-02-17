@@ -32,6 +32,27 @@ from .ray_cluster_master import RayDPSparkMaster, SPARK_JAVAAGENT, SPARK_PREFER_
 from raydp import versions
 
 
+# JDK 17+ module opens required by Spark 4.1 (Arrow, Netty, Kryo, Scala reflection).
+# Auto-injected into driver, executor, and app master extraJavaOptions.
+_JDK17_MODULE_OPENS = " ".join([
+    "-XX:+IgnoreUnrecognizedVMOptions",
+    "--add-opens=java.base/java.lang=ALL-UNNAMED",
+    "--add-opens=java.base/java.lang.invoke=ALL-UNNAMED",
+    "--add-opens=java.base/java.io=ALL-UNNAMED",
+    "--add-opens=java.base/java.net=ALL-UNNAMED",
+    "--add-opens=java.base/java.nio=ALL-UNNAMED",
+    "--add-opens=java.base/java.math=ALL-UNNAMED",
+    "--add-opens=java.base/java.text=ALL-UNNAMED",
+    "--add-opens=java.base/java.util=ALL-UNNAMED",
+    "--add-opens=java.base/java.util.concurrent=ALL-UNNAMED",
+    "--add-opens=java.base/java.util.concurrent.atomic=ALL-UNNAMED",
+    "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED",
+    "--add-opens=java.base/sun.nio.cs=ALL-UNNAMED",
+    "--add-opens=java.base/sun.security.action=ALL-UNNAMED",
+    "--add-opens=java.base/sun.util.calendar=ALL-UNNAMED",
+])
+
+
 class SparkCluster(Cluster):
     def __init__(self,
                  app_name,
@@ -116,6 +137,17 @@ class SparkCluster(Cluster):
     def _prepare_spark_configs(self):
         if self._configs is None:
             self._configs = {}
+
+        # Auto-inject JDK 17+ module opens for Spark 4.1
+        for _key in ("spark.driver.extraJavaOptions",
+                     "spark.executor.extraJavaOptions",
+                     "spark.ray.raydp_app_master.extraJavaOptions"):
+            _existing = self._configs.get(_key, "")
+            if _existing:
+                self._configs[_key] = _JDK17_MODULE_OPENS + " " + _existing
+            else:
+                self._configs[_key] = _JDK17_MODULE_OPENS
+
         self._configs["spark.executor.instances"] = str(self._num_executors)
         self._configs["spark.executor.cores"] = str(self._executor_cores)
         self._configs["spark.executor.memory"] = str(self._executor_memory)
@@ -194,7 +226,7 @@ class SparkCluster(Cluster):
                      "-D" + versions.SPARK_LOG4J_CONFIG_FILE_NAME_KEY + "=" +
                      self._configs[SPARK_LOG4J_CONFIG_FILE_NAME]
                      ]
-        # Append to existing driver options if they exist (e.g., JDK 17+ flags)
+        # Append to existing driver options (auto-injected JDK 17+ flags + any user flags)
         existing_driver_opts = self._configs.get("spark.driver.extraJavaOptions", "")
         if existing_driver_opts:
             all_opts = existing_driver_opts + " " + " ".join(java_opts)

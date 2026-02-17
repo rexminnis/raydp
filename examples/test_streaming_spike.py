@@ -28,24 +28,6 @@ from raydp.streaming import (
 
 os.environ["RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO"] = "0"
 
-JDK17_JAVA_OPTS = " ".join([
-    "-XX:+IgnoreUnrecognizedVMOptions",
-    "--add-opens=java.base/java.lang=ALL-UNNAMED",
-    "--add-opens=java.base/java.lang.invoke=ALL-UNNAMED",
-    "--add-opens=java.base/java.io=ALL-UNNAMED",
-    "--add-opens=java.base/java.net=ALL-UNNAMED",
-    "--add-opens=java.base/java.nio=ALL-UNNAMED",
-    "--add-opens=java.base/java.math=ALL-UNNAMED",
-    "--add-opens=java.base/java.text=ALL-UNNAMED",
-    "--add-opens=java.base/java.util=ALL-UNNAMED",
-    "--add-opens=java.base/java.util.concurrent=ALL-UNNAMED",
-    "--add-opens=java.base/java.util.concurrent.atomic=ALL-UNNAMED",
-    "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED",
-    "--add-opens=java.base/sun.nio.cs=ALL-UNNAMED",
-    "--add-opens=java.base/sun.security.action=ALL-UNNAMED",
-    "--add-opens=java.base/sun.util.calendar=ALL-UNNAMED",
-])
-
 MIN_CONSUMER_TABLES = 5
 TIMEOUT_SECONDS = 30
 
@@ -73,9 +55,6 @@ spark = raydp.init_spark(
         "spark.network.timeout": "120s",
         "spark.executor.heartbeatInterval": "20s",
         "spark.ui.enabled": "false",
-        "spark.executor.extraJavaOptions": JDK17_JAVA_OPTS,
-        "spark.driver.extraJavaOptions": JDK17_JAVA_OPTS,
-        "spark.ray.raydp_app_master.extraJavaOptions": JDK17_JAVA_OPTS,
     },
 )
 print(f"Spark {spark.version} ready")

@@ -39,7 +39,7 @@ def test_spark(spark_on_ray_small):
     assert result == 10
 
 
-def test_legacy_spark_on_fractional_cpu(jdk17_extra_spark_configs):
+def test_legacy_spark_on_fractional_cpu():
     cluster = Cluster(
         initialize_head=True,
         head_node_args={
@@ -53,8 +53,7 @@ def test_legacy_spark_on_fractional_cpu(jdk17_extra_spark_configs):
     )
     spark = raydp.init_spark(app_name="test_cpu_fraction",
                              num_executors=1, executor_cores=3, executor_memory="500M",
-                             configs={"spark.ray.actor.resource.cpu": "0.1",
-                                      **jdk17_extra_spark_configs})
+                             configs={"spark.ray.actor.resource.cpu": "0.1"})
     result = spark.range(0, 10).count()
     assert result == 10
 
@@ -65,7 +64,7 @@ def test_legacy_spark_on_fractional_cpu(jdk17_extra_spark_configs):
     cluster.shutdown()
 
 
-def test_spark_executor_on_fractional_cpu(jdk17_extra_spark_configs):
+def test_spark_executor_on_fractional_cpu():
     cluster = Cluster(
         initialize_head=True,
         head_node_args={
@@ -75,8 +74,7 @@ def test_spark_executor_on_fractional_cpu(jdk17_extra_spark_configs):
     ray.init(address=cluster.address, include_dashboard=False)
     spark = raydp.init_spark(app_name="test_cpu_fraction",
                              num_executors=1, executor_cores=3, executor_memory="500M",
-                             configs={"spark.ray.raydp_spark_executor.actor.resource.cpu": "0.1",
-                                      **jdk17_extra_spark_configs})
+                             configs={"spark.ray.raydp_spark_executor.actor.resource.cpu": "0.1"})
     result = spark.range(0, 10).count()
     assert result == 10
 
@@ -87,7 +85,7 @@ def test_spark_executor_on_fractional_cpu(jdk17_extra_spark_configs):
     cluster.shutdown()
 
 
-def test_spark_executor_node_affinity(jdk17_extra_spark_configs):
+def test_spark_executor_node_affinity():
     cluster = Cluster(
         initialize_head=True,
         head_node_args={
@@ -98,8 +96,7 @@ def test_spark_executor_node_affinity(jdk17_extra_spark_configs):
     ray.init(address=cluster.address, include_dashboard=False)
     spark = raydp.init_spark(app_name="test_executor_node_affinity",
                              num_executors=1, executor_cores=2, executor_memory="500M",
-                             configs={"spark.ray.raydp_spark_executor.actor.resource.spark_executor": "1",
-                                      **jdk17_extra_spark_configs})
+                             configs={"spark.ray.raydp_spark_executor.actor.resource.spark_executor": "1"})
     result = spark.range(0, 10).count()
     assert result == 10
 
@@ -147,7 +144,7 @@ def test_spark_driver_and_executor_hostname(spark_on_ray_small):
     assert node_ip_address == driver_bind_address
 
 
-def test_ray_dataset_roundtrip(jdk17_extra_spark_configs):
+def test_ray_dataset_roundtrip():
     cluster = Cluster(
         initialize_head=True,
         head_node_args={
@@ -155,10 +152,9 @@ def test_ray_dataset_roundtrip(jdk17_extra_spark_configs):
         }
     )
     ray.init(address=cluster.address, include_dashboard=False)
-    
-    spark = raydp.init_spark(app_name="test_ray_dataset_roundtrip", num_executors=2, 
-                             executor_cores=1, executor_memory="500M",
-                             configs=jdk17_extra_spark_configs)
+
+    spark = raydp.init_spark(app_name="test_ray_dataset_roundtrip", num_executors=2,
+                             executor_cores=1, executor_memory="500M")
 
     # skipping this to be compatible with ray 2.4.0
     # see issue #343
@@ -217,11 +213,10 @@ def test_ray_dataset_to_spark(spark_on_ray_2_executors):
 
 
 @pytest.mark.parametrize("ray_cluster", ["local"], indirect=True)
-def test_placement_group(ray_cluster, jdk17_extra_spark_configs):
+def test_placement_group(ray_cluster):
     for pg_strategy in ["PACK", "STRICT_PACK", "SPREAD", "STRICT_SPREAD"]:
         spark = raydp.init_spark(f"test_strategy_{pg_strategy}_1", 1, 1, "500M",
-                                 placement_group_strategy=pg_strategy,
-                                 configs=jdk17_extra_spark_configs)
+                                 placement_group_strategy=pg_strategy)
         result = spark.range(0, 10, numPartitions=10).count()
         assert result == 10
         raydp.stop_spark()
@@ -243,8 +238,7 @@ def test_placement_group(ray_cluster, jdk17_extra_spark_configs):
 
         # w/ existing placement group w/o bundle indexes
         spark = raydp.init_spark(f"test_bundle_{pg_strategy}_3", 1, 1, "500M",
-                                 placement_group=pg,
-                                 configs=jdk17_extra_spark_configs)
+                                 placement_group=pg)
         result = spark.range(0, 10, numPartitions=10).count()
         assert result == 10
         raydp.stop_spark()
@@ -259,7 +253,7 @@ def test_placement_group(ray_cluster, jdk17_extra_spark_configs):
     assert num_non_removed_pgs == 0
 
 
-def test_reconstruction(jdk17_extra_spark_configs):
+def test_reconstruction():
     cluster = Cluster(
         initialize_head=True,
         head_node_args={
@@ -267,15 +261,14 @@ def test_reconstruction(jdk17_extra_spark_configs):
             "enable_object_reconstruction": True
         }
     )
-    
+
     ray.init(
         address=cluster.address,
         include_dashboard=False,
         job_config=JobConfig(code_search_path=[os.getcwd()]),
     )
     # init_spark before adding nodes to ensure drivers connect to the head node
-    spark = raydp.init_spark('a', 2, 1, '500m', fault_tolerant_mode=True,
-                             configs=jdk17_extra_spark_configs)
+    spark = raydp.init_spark('a', 2, 1, '500m', fault_tolerant_mode=True)
     # Add two nodes, 1 executor each
     node_to_kill = cluster.add_node(num_cpus=1, object_store_memory=10 ** 8)
     cluster.add_node(num_cpus=1, object_store_memory=10 ** 8)

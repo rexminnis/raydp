@@ -18,8 +18,6 @@
 import logging
 import subprocess
 import time
-from typing import Dict
-
 import pyspark
 import pytest
 import ray
@@ -36,38 +34,8 @@ def quiet_logger():
     koalas_logger.setLevel(logging.WARNING)
 
 @pytest.fixture(scope="function")
-def jdk17_extra_spark_configs() -> Dict[str, str]:
-    # JDK 17+ requires --add-opens for reflective access and --add-exports for direct access
-    # to internal JDK modules. These are needed for Spark, Ray serialization, and RayDP.
-    java_opts = " ".join([
-        "-XX:+IgnoreUnrecognizedVMOptions",
-        "--add-opens=java.base/java.lang=ALL-UNNAMED",
-        "--add-opens=java.base/java.lang.invoke=ALL-UNNAMED",
-        "--add-opens=java.base/java.io=ALL-UNNAMED",
-        "--add-opens=java.base/java.net=ALL-UNNAMED",
-        "--add-opens=java.base/java.nio=ALL-UNNAMED",
-        "--add-opens=java.base/java.math=ALL-UNNAMED",
-        "--add-opens=java.base/java.text=ALL-UNNAMED",
-        "--add-opens=java.base/java.util=ALL-UNNAMED",
-        "--add-opens=java.base/java.util.concurrent=ALL-UNNAMED",
-        "--add-opens=java.base/java.util.concurrent.atomic=ALL-UNNAMED",
-        "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED",
-        "--add-opens=java.base/sun.nio.cs=ALL-UNNAMED",
-        "--add-opens=java.base/sun.security.action=ALL-UNNAMED",
-        "--add-opens=java.base/sun.util.calendar=ALL-UNNAMED",
-    ])
-    extra_configs = {
-        "spark.executor.extraJavaOptions": java_opts,
-        "spark.driver.extraJavaOptions": java_opts,
-        "spark.ray.raydp_app_master.extraJavaOptions": java_opts,
-    }
-    return extra_configs
-
-@pytest.fixture(scope="function")
-def spark_session(request, jdk17_extra_spark_configs):
+def spark_session(request):
     builder = SparkSession.builder.master("local[2]").appName("RayDP test")
-    for k, v in jdk17_extra_spark_configs.items():
-        builder = builder.config(k, v)
     spark = builder.getOrCreate()
     request.addfinalizer(lambda: spark.stop())
     quiet_logger()
@@ -85,7 +53,7 @@ def ray_cluster(request):
 
 
 @pytest.fixture(scope="function", params=["local", "ray://localhost:10001"])
-def spark_on_ray_small(request, jdk17_extra_spark_configs):
+def spark_on_ray_small(request):
     ray.shutdown()
     if request.param == "local":
         ray.init(address="local", num_cpus=6, include_dashboard=False)
@@ -98,7 +66,6 @@ def spark_on_ray_small(request, jdk17_extra_spark_configs):
     extra_configs = {
         "spark.driver.host": node_ip,
         "spark.driver.bindAddress": node_ip,
-        **jdk17_extra_spark_configs
     }
     spark = raydp.init_spark("test", 1, 1, "500M", configs=extra_configs)
 
@@ -113,7 +80,7 @@ def spark_on_ray_small(request, jdk17_extra_spark_configs):
 
 
 @pytest.fixture(scope="function", params=["local", "ray://localhost:10001"])
-def spark_on_ray_2_executors(request, jdk17_extra_spark_configs):
+def spark_on_ray_2_executors(request):
     ray.shutdown()
     if request.param == "local":
         ray.init(address="local", num_cpus=6, include_dashboard=False)
@@ -126,7 +93,6 @@ def spark_on_ray_2_executors(request, jdk17_extra_spark_configs):
     extra_configs = {
         "spark.driver.host": node_ip,
         "spark.driver.bindAddress": node_ip,
-        **jdk17_extra_spark_configs
     }
     spark = raydp.init_spark("test", 2, 1, "500M", configs=extra_configs)
 

@@ -31,7 +31,7 @@ def ray_gc():
 
 
 @pytest.mark.parametrize("ray_cluster", ["local"], indirect=True)
-def test_api_compatibility(ray_cluster, jdk17_extra_spark_configs):
+def test_api_compatibility(ray_cluster):
   """
   Test the changes been made are not to break public APIs.
   """
@@ -46,7 +46,6 @@ def test_api_compatibility(ray_cluster, jdk17_extra_spark_configs):
     num_executors = num_executor,
     executor_cores = 1,
     executor_memory = "500M",
-    configs=jdk17_extra_spark_configs
     )
 
   df_train = gen_test_data(spark)
