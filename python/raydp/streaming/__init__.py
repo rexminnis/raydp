@@ -7,7 +7,7 @@ import ray
 
 from raydp.streaming.coordinator import StreamCoordinator
 from raydp.streaming.consumer import StreamingIterator
-from raydp.streaming.sink import SparkStreamingSink
+from raydp.streaming.sink import SparkStreamingSink, JvmStreamingSink
 from raydp.streaming.source import (
     _JvmBridgeThread,
     _ProducerThread,
@@ -24,6 +24,7 @@ def from_spark_streaming(
     max_buffered_bytes=2 * 1024**3,
     trigger=None,
     checkpoint_location=None,
+    use_jvm_sink=False,
 ):
     """Start consuming a Spark Structured Streaming DataFrame via Ray.
 
@@ -44,12 +45,23 @@ def from_spark_streaming(
         Spark trigger config, e.g. {"processingTime": "2 seconds"}.
     checkpoint_location : str, optional
         Spark checkpoint directory for the streaming query.
+    use_jvm_sink : bool
+        If True, use JvmStreamingSink which dispatches Ray tasks to fetch
+        Arrow data directly from Spark executor actors, bypassing the driver
+        bottleneck. Requires a RayDP cluster (executor actors running).
+        Default False uses SparkStreamingSink (all data through driver).
     """
     stream_id = stream_id or f"stream_{uuid.uuid4().hex[:8]}"
-    sink = SparkStreamingSink(
-        stream_id=stream_id, max_buffered_batches=max_buffered_batches,
-        max_buffered_bytes=max_buffered_bytes,
-    )
+    if use_jvm_sink:
+        sink = JvmStreamingSink(
+            stream_id=stream_id, max_buffered_batches=max_buffered_batches,
+            max_buffered_bytes=max_buffered_bytes,
+        )
+    else:
+        sink = SparkStreamingSink(
+            stream_id=stream_id, max_buffered_batches=max_buffered_batches,
+            max_buffered_bytes=max_buffered_bytes,
+        )
 
     writer = streaming_df.writeStream.foreachBatch(sink.process_batch)
 
@@ -267,6 +279,7 @@ def to_spark_streaming(
 __all__ = [
     "StreamCoordinator",
     "SparkStreamingSink",
+    "JvmStreamingSink",
     "StreamingIterator",
     "from_spark_streaming",
     "to_spark_streaming",

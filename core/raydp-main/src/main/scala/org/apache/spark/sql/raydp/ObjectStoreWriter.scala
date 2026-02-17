@@ -124,7 +124,7 @@ object ObjectStoreWriter {
 
     val handle = new StreamingRecoverableRDD(
       rdd.id, numPartitions, schemaJson, driverAgentUrl,
-      restartedExecutors, SparkEnv.get)
+      restartedExecutors, SparkEnv.get, rdd)
 
     // Start materialization in background — partitions become visible via getReadyPartitions()
     val thread = new Thread("raydp-materialize-" + rdd.id) {
@@ -170,7 +170,8 @@ class StreamingRecoverableRDD(
     val schemaJson: String,
     val driverAgentUrl: String,
     private val restartedExecutors: java.util.Map[String, String],
-    private val env: SparkEnv) {
+    private val env: SparkEnv,
+    private val rdd: org.apache.spark.rdd.RDD[_] = null) {
 
   @volatile private var _error: Throwable = _
   @volatile private var _complete: Boolean = false
@@ -184,6 +185,7 @@ class StreamingRecoverableRDD(
 
   def isComplete: Boolean = _complete
   def getError: String = if (_error != null) _error.getMessage else null
+  def unpersist(): Unit = if (rdd != null) rdd.unpersist(false)
 
   /**
    * Returns an Array[String] of length numPartitions.

@@ -1059,6 +1059,71 @@ def test_streaming_iter_datasets_end_to_end(spark_on_ray_small):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("spark_on_ray_small", ["local"], indirect=True)
+def test_jvm_sink_end_to_end(spark_on_ray_small):
+    """Spark rate source → from_spark_streaming(use_jvm_sink=True) → consume tables → verify.
+
+    Uses JvmStreamingSink which dispatches Ray tasks to fetch Arrow data directly
+    from executor actors, bypassing the PySpark driver bottleneck.
+    """
+    from raydp.streaming import from_spark_streaming
+
+    spark = spark_on_ray_small
+    time.sleep(10)
+
+    rate_stream = (
+        spark.readStream
+        .format("rate")
+        .option("rowsPerSecond", "10")
+        .load()
+    )
+
+    iterator, query = from_spark_streaming(
+        rate_stream,
+        stream_id="e2e_jvm_sink",
+        max_buffered_batches=4,
+        trigger={"processingTime": "2 seconds"},
+        use_jvm_sink=True,
+    )
+
+    consumed = []
+    consumer_error = None
+
+    def consumer_fn():
+        nonlocal consumer_error
+        try:
+            for table in iterator:
+                consumed.append(table)
+                if len(consumed) >= 5:
+                    return
+        except Exception as e:
+            consumer_error = e
+
+    t = threading.Thread(target=consumer_fn, daemon=True)
+    t.start()
+
+    deadline = time.time() + 60
+    while len(consumed) < 5 and time.time() < deadline:
+        time.sleep(1)
+
+    coord = ray.get_actor("stream_coord_e2e_jvm_sink")
+    stats = ray.get(coord.get_stats.remote())
+
+    query.stop()
+    t.join(timeout=10)
+
+    assert consumer_error is None, f"Consumer error: {consumer_error}"
+    assert len(consumed) >= 5, f"Expected 5+ tables, got {len(consumed)}"
+
+    for table in consumed:
+        assert isinstance(table, pa.Table)
+        assert "timestamp" in table.column_names
+        assert "value" in table.column_names
+        assert table.num_rows > 0
+
+    assert stats["buffer_size"] <= 4
+
+
+@pytest.mark.parametrize("spark_on_ray_small", ["local"], indirect=True)
 def test_reverse_bridge_end_to_end(spark_on_ray_small):
     """Arrow tables → to_spark_streaming() → Spark memory sink → verify rows."""
     from raydp.streaming import to_spark_streaming
