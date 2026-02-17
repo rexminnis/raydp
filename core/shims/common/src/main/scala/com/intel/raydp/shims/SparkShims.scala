@@ -43,4 +43,6 @@ trait SparkShims {
   def toArrowSchema(schema : StructType, timeZoneId : String, largeVarTypes : Boolean = false) : Schema
 
   def toArrowBatchRdd(df: DataFrame): RDD[Array[Byte]]
+
+  def fromArrowBatchBytes(arrowBatch: Array[Byte], schemaJson: String, timeZoneId: String): Iterator[org.apache.spark.sql.catalyst.InternalRow]
 }

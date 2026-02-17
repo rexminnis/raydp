@@ -30,4 +30,8 @@ class SparkShims411 extends SparkShims {
   override def toArrowBatchRdd(df: DataFrame): RDD[Array[Byte]] = {
     Spark411SQLHelper.toArrowBatchRdd(df)
   }
+
+  override def fromArrowBatchBytes(arrowBatch: Array[Byte], schemaJson: String, timeZoneId: String): Iterator[org.apache.spark.sql.catalyst.InternalRow] = {
+    Spark411SQLHelper.fromArrowBatchBytes(arrowBatch, schemaJson, timeZoneId)
+  }
 }

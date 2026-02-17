@@ -11,6 +11,7 @@ import ray
 from raydp.streaming.coordinator import StreamCoordinator
 from raydp.streaming.consumer import StreamingIterator
 from raydp.streaming.sink import SparkStreamingSink
+from raydp.streaming.source import _ProducerThread
 from raydp.streaming.monitor import print_stats
 from raydp.streaming import create_partitioned_iterators
 
@@ -772,6 +773,154 @@ class TestByteTrackingInStats:
 
 
 # ---------------------------------------------------------------------------
+# Phase 5 unit tests — reverse bridge (Ray → Spark) coordinator + producer
+# ---------------------------------------------------------------------------
+
+class TestGetLatestBatchId:
+
+    def test_returns_next_batch_id(self, ray_env):
+        """get_latest_batch_id returns the number of published batches."""
+        coord = StreamCoordinator.remote(stream_id="test_latest_bid", max_buffered_batches=10)
+
+        assert ray.get(coord.get_latest_batch_id.remote()) == 0
+
+        for i in range(5):
+            _publish_table(coord, _make_table(3, i))
+
+        assert ray.get(coord.get_latest_batch_id.remote()) == 5
+
+
+class TestGetBatchRefs:
+
+    def test_returns_refs_for_requested_ids(self, ray_env):
+        """get_batch_refs returns resolvable ObjectRefs for each requested batch."""
+        coord = StreamCoordinator.remote(stream_id="test_get_refs", max_buffered_batches=10)
+        tables = [_make_table(3, i) for i in range(5)]
+
+        for t in tables:
+            _publish_table(coord, t)
+
+        infos = ray.get(coord.get_batch_refs.remote([0, 1, 2]))
+        assert len(infos) == 3
+
+        for i, info in enumerate(infos):
+            assert info["batch_id"] == i
+            assert info["num_rows"] == 3
+            resolved = ray.get(info["partition_refs"])
+            assert len(resolved) == 1
+            assert resolved[0].equals(tables[i])
+
+
+class TestGetBatchRefsGcRaises:
+
+    def test_raises_on_gc_batch(self, ray_env):
+        """get_batch_refs raises ValueError for GC'd batch IDs."""
+        coord = StreamCoordinator.remote(stream_id="test_refs_gc", max_buffered_batches=10)
+
+        for i in range(5):
+            _publish_table(coord, _make_table(3, i))
+
+        # Register consumer, consume all 5, triggering GC
+        ray.get(coord.register_consumer.remote("c1"))
+        for _ in range(5):
+            ray.get(coord.pull_batch.remote("c1"))
+
+        with pytest.raises(ray.exceptions.RayTaskError) as exc_info:
+            ray.get(coord.get_batch_refs.remote([0]))
+        assert "GC'd" in str(exc_info.value)
+
+        ray.get(coord.deregister_consumer.remote("c1"))
+
+
+class TestAckCommittedTriggersGc:
+
+    def test_ack_committed_gc(self, ray_env):
+        """ack_committed registers synthetic consumer and triggers GC."""
+        coord = StreamCoordinator.remote(stream_id="test_ack_gc", max_buffered_batches=10)
+
+        for i in range(5):
+            _publish_table(coord, _make_table(3, i))
+
+        stats = ray.get(coord.get_stats.remote())
+        assert stats["buffer_size"] == 5
+
+        # ack_committed(3) means batches 0,1,2 are eligible for GC
+        ray.get(coord.ack_committed.remote(3))
+
+        stats = ray.get(coord.get_stats.remote())
+        assert stats["buffer_size"] == 2  # batches 3,4 remain
+        assert stats["batches_gc"] == 3
+
+
+class TestProducerThread:
+
+    def test_iterator_source_publishes_all(self, ray_env):
+        """_ProducerThread with iterator source publishes all tables and signals complete."""
+        coord = StreamCoordinator.remote(stream_id="test_prod_iter", max_buffered_batches=10)
+        tables = [_make_table(3, i) for i in range(5)]
+
+        producer = _ProducerThread(iter(tables), coord, "test_prod_iter")
+        producer.start()
+        producer.join(timeout=10)
+
+        assert not producer.is_alive()
+        assert producer.error is None
+
+        stats = ray.get(coord.get_stats.remote())
+        assert stats["batches_published"] == 5
+        assert stats["complete"] is True
+
+
+class TestProducerThreadError:
+
+    def test_error_signals_coordinator(self, ray_env):
+        """_ProducerThread that raises signals error on coordinator."""
+        coord = StreamCoordinator.remote(stream_id="test_prod_err", max_buffered_batches=10)
+
+        def bad_source():
+            yield _make_table(3, 0)
+            raise RuntimeError("source failed")
+
+        producer = _ProducerThread(bad_source(), coord, "test_prod_err")
+        producer.start()
+        producer.join(timeout=10)
+
+        assert not producer.is_alive()
+        assert producer.error is not None
+        assert "source failed" in str(producer.error)
+
+        stats = ray.get(coord.get_stats.remote())
+        assert stats["error"] is not None
+        assert "source failed" in stats["error"]
+
+
+class TestProducerThreadCallable:
+
+    def test_callable_source_publishes_all(self, ray_env):
+        """_ProducerThread with callable source publishes until None."""
+        coord = StreamCoordinator.remote(stream_id="test_prod_call", max_buffered_batches=10)
+        call_count = [0]
+
+        def source_fn():
+            if call_count[0] >= 3:
+                return None
+            table = _make_table(3, call_count[0])
+            call_count[0] += 1
+            return table
+
+        producer = _ProducerThread(source_fn, coord, "test_prod_call")
+        producer.start()
+        producer.join(timeout=10)
+
+        assert not producer.is_alive()
+        assert producer.error is None
+
+        stats = ray.get(coord.get_stats.remote())
+        assert stats["batches_published"] == 3
+        assert stats["complete"] is True
+
+
+# ---------------------------------------------------------------------------
 # Integration test — end-to-end with Spark
 # ---------------------------------------------------------------------------
 
@@ -821,6 +970,10 @@ def test_streaming_end_to_end(spark_on_ray_small):
     while len(consumed) < 5 and time.time() < deadline:
         time.sleep(1)
 
+    # Grab stats before stop() kills the coordinator
+    coord = ray.get_actor(f"stream_coord_e2e_test")
+    stats = ray.get(coord.get_stats.remote())
+
     query.stop()
     t.join(timeout=10)
 
@@ -834,8 +987,6 @@ def test_streaming_end_to_end(spark_on_ray_small):
         assert table.num_rows > 0
 
     # Verify backpressure — coordinator buffer never exceeded max
-    coord = ray.get_actor(f"stream_coord_e2e_test")
-    stats = ray.get(coord.get_stats.remote())
     assert stats["buffer_size"] <= 4
 
 
@@ -901,3 +1052,107 @@ def test_streaming_iter_datasets_end_to_end(spark_on_ray_small):
         schema_names = ds.schema().names
         assert "timestamp" in schema_names
         assert "value" in schema_names
+
+
+# ---------------------------------------------------------------------------
+# Integration test — reverse bridge (Ray → Spark) end-to-end
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("spark_on_ray_small", ["local"], indirect=True)
+def test_reverse_bridge_end_to_end(spark_on_ray_small):
+    """Arrow tables → to_spark_streaming() → Spark memory sink → verify rows."""
+    from raydp.streaming import to_spark_streaming
+
+    spark = spark_on_ray_small
+    time.sleep(10)
+
+    # Produce 10 tables with known data
+    tables = [_make_table(5, i) for i in range(10)]
+
+    streaming_df, handle = to_spark_streaming(
+        iter(tables),
+        spark,
+        stream_id="e2e_reverse",
+        max_buffered_batches=16,
+    )
+
+    # Write to memory sink
+    query = (
+        streaming_df.writeStream
+        .format("memory")
+        .queryName("reverse_test")
+        .outputMode("append")
+        .trigger(processingTime="1 second")
+        .start()
+    )
+
+    # Wait for all rows to appear (10 tables × 5 rows = 50 rows)
+    expected_rows = 50
+    deadline = time.time() + 60
+    actual_rows = 0
+    while time.time() < deadline:
+        actual_rows = spark.sql("SELECT count(*) FROM reverse_test").collect()[0][0]
+        if actual_rows >= expected_rows:
+            break
+        time.sleep(1)
+
+    query.stop()
+    handle.stop()
+
+    assert actual_rows >= expected_rows, (
+        f"Expected {expected_rows} rows, got {actual_rows}"
+    )
+
+    # Verify schema
+    result_df = spark.sql("SELECT * FROM reverse_test")
+    assert "id" in result_df.columns
+    assert "value" in result_df.columns
+
+    # Verify no producer error
+    assert handle.producer_error is None
+
+
+@pytest.mark.parametrize("spark_on_ray_small", ["local"], indirect=True)
+def test_reverse_bridge_backpressure_end_to_end(spark_on_ray_small):
+    """Fast producer with small buffer — verify coordinator buffer stays bounded."""
+    from raydp.streaming import to_spark_streaming
+
+    spark = spark_on_ray_small
+    time.sleep(10)
+
+    # Produce 30 tables — more than the 4-batch buffer
+    tables = [_make_table(5, i) for i in range(30)]
+
+    streaming_df, handle = to_spark_streaming(
+        iter(tables),
+        spark,
+        stream_id="e2e_bp_reverse",
+        max_buffered_batches=4,
+    )
+
+    query = (
+        streaming_df.writeStream
+        .format("memory")
+        .queryName("bp_reverse_test")
+        .outputMode("append")
+        .trigger(processingTime="1 second")
+        .start()
+    )
+
+    # Wait for some rows to appear
+    deadline = time.time() + 60
+    while time.time() < deadline:
+        rows = spark.sql("SELECT count(*) FROM bp_reverse_test").collect()[0][0]
+        if rows >= 50:  # at least 10 tables consumed
+            break
+        time.sleep(1)
+
+    # Check buffer never exceeded max
+    coord = ray.get_actor("stream_coord_e2e_bp_reverse")
+    stats = ray.get(coord.get_stats.remote())
+    assert stats["buffer_size"] <= 4, (
+        f"Buffer exceeded max: {stats['buffer_size']}"
+    )
+
+    query.stop()
+    handle.stop()

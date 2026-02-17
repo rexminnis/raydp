@@ -50,6 +50,63 @@ object Spark411SQLHelper {
     })
   }
 
+  def fromArrowBatchBytes(arrowIpcBytes: Array[Byte], schemaJson: String, timeZoneId: String): Iterator[org.apache.spark.sql.catalyst.InternalRow] = {
+    import org.apache.arrow.vector.VectorUnloader
+    import org.apache.arrow.vector.ipc.ArrowStreamReader
+    import org.apache.arrow.vector.ipc.WriteChannel
+    import org.apache.arrow.vector.ipc.message.MessageSerializer
+    import java.io.{ByteArrayInputStream, ByteArrayOutputStream}
+    import java.nio.channels.Channels
+    import scala.collection.mutable.ArrayBuffer
+
+    if (arrowIpcBytes == null || arrowIpcBytes.isEmpty) {
+      return Iterator.empty
+    }
+
+    val structType = DataType.fromJson(schemaJson).asInstanceOf[StructType]
+
+    // Read the Python IPC stream and re-serialize each batch to Spark's
+    // expected Arrow batch message format (MessageSerializer.serialize).
+    val allocator = ArrowUtils.rootAllocator.newChildAllocator(
+      "raydp-ipc-reader", 0, Long.MaxValue)
+    val batchBytesList = new ArrayBuffer[Array[Byte]]()
+
+    try {
+      val reader = new ArrowStreamReader(
+        new ByteArrayInputStream(arrowIpcBytes), allocator)
+      try {
+        while (reader.loadNextBatch()) {
+          val root = reader.getVectorSchemaRoot
+          val unloader = new VectorUnloader(root)
+          val arrowBatch = unloader.getRecordBatch()
+          try {
+            val out = new ByteArrayOutputStream()
+            val channel = new WriteChannel(Channels.newChannel(out))
+            MessageSerializer.serialize(channel, arrowBatch)
+            channel.close()
+            batchBytesList += out.toByteArray()
+          } finally {
+            arrowBatch.close()
+          }
+        }
+      } finally {
+        reader.close()
+      }
+    } finally {
+      allocator.close()
+    }
+
+    // Feed the Spark-format batch bytes to ArrowConverters.fromBatchIterator
+    ArrowConverters.fromBatchIterator(
+      batchBytesList.iterator,
+      structType,
+      timeZoneId,
+      true,  // errorOnDuplicatedFieldNames
+      false, // largeVarTypes
+      TaskContext.get()
+    )
+  }
+
   /**
    * Converts a JavaRDD of Arrow batches (serialized as byte arrays) to a DataFrame.
    * This is the reverse operation of toArrowBatchRdd.

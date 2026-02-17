@@ -355,6 +355,52 @@ class StreamCoordinator:
                 and self._buffered_bytes < self._max_bytes):
             self._space_available.set()
 
+    # -- Reverse bridge (Ray → Spark) query API --
+
+    async def get_latest_batch_id(self) -> int:
+        """Return the exclusive upper bound of published batch IDs.
+
+        Used by RayStreamReader.latestOffset() to discover new batches.
+        """
+        return self._next_batch_id
+
+    async def get_batch_refs(self, batch_ids: List[int]) -> List[dict]:
+        """Return batch metadata for each requested batch_id.
+
+        Returns list of dicts with keys: batch_id, partition_refs, num_rows, num_bytes.
+        Raises ValueError if any batch_id has been GC'd or not yet published.
+        Used by RayStreamReader.partitions() to pack ObjectRefs into InputPartitions.
+        """
+        results = []
+        for bid in batch_ids:
+            if bid not in self._buffer:
+                if bid < self._next_batch_id:
+                    raise ValueError(f"Batch {bid} has been GC'd")
+                else:
+                    raise ValueError(f"Batch {bid} has not been published yet")
+            mb = self._buffer[bid]
+            results.append({
+                "batch_id": mb.batch_id,
+                "partition_refs": mb.partition_refs,
+                "num_rows": mb.num_rows,
+                "num_bytes": mb.num_bytes,
+            })
+        return results
+
+    async def ack_committed(self, batch_id: int) -> None:
+        """Register a synthetic Spark reader consumer and advance its cursor.
+
+        This triggers GC for batches below `batch_id`, using the same
+        min-cursor protocol that real consumers use. Called by
+        RayStreamReader.commit() after Spark has durably processed a batch.
+        """
+        consumer_id = "__spark_reader__"
+        if consumer_id not in self._consumers:
+            self._consumers[consumer_id] = 0
+            self._consumer_partitions[consumer_id] = None
+        self._consumers[consumer_id] = batch_id
+        self._gc_batches()
+
     # -- Observability --
 
     async def get_watermark(self) -> Optional[str]:
